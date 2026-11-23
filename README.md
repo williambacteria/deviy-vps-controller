@@ -1,201 +1,254 @@
-# Deviy VPS Controller：主控程序与管理 UI
+# Deviy 虚拟化主控、宿主机 Agent 与虚拟机 Guest Agent
 
-对应站点 **demovps.deviy.cn**，为 Deviy 财务提供基础设施控制能力。本仓库为 **2026-11-23** 在用部署的私有归档，包含 Linux x86-64 可执行程序、独立 UI 静态资源、无密钥配置样例与部署说明。
+对应 demovps.deviy.cn 的 Go 工程与配套部署资料，包含集中控制台、宿主机被控和虚拟机内部辅助程序。
 
-## 一、重要范围说明
+**2026-11-24 已找回并补充 Go 源码。** 源码来自项目所有者指定的本地 Deviy.cn 工程，含两个 Go Module。本仓库不再仅是可执行程序归档。按照所有者本次确认，仓库保持公开；生产密钥、证书、节点状态、客户数据、镜像和磁盘不在仓库内。
 
-**没有找到 Go 后端源码。** 原站点目录包含已编译的 Go 程序 deviy-controller，没有 go.mod、main.go 或后端源代码。本次也检查了服务器常用部署路径，未发现对应 Go 工程。
+## 一、三个程序分别装在哪里
 
-因此：
+| 程序 | 源码入口 | 安装位置 | 作用 |
+| --- | --- | --- | --- |
+| Deviy Controller | controller/cmd/deviy-controller | 集中主控服务器 | 节点聚合、Web 管理、镜像、IP 池、主机配置、操作代理 |
+| Deviy Agent | agent/cmd/deviy-agent | 实际虚拟化宿主机 | 对接 KVM/libvirt、PVE 或 Hyper-V，执行 VM、NAT、监控和 Guest 操作 |
+| Deviy Guest Agent | agent/cmd/deviy-guest-agent | Windows / Linux 客户虚拟机内部 | 修改密码、设置网络/DNS/主机名、磁盘扩容等 |
+| deviy-cert | agent/cmd/deviy-cert | 管理员离线配置环境 | 生成测试/部署用 mTLS 证书，生成结果不提交仓库 |
 
-- 可以在兼容的 Linux x86-64 环境运行归档的可执行程序。
-- 可以修改 ui-azure 里的 JavaScript、CSS、Logo 和字体。
-- 无法仅凭本仓库重新编译或修改 Go 后端。
-- 其他虚拟化节点上的 Agent、镜像、磁盘与虚拟机不属于本仓库。
-- 真实节点、Token、IP 池和虚拟机绑定保存在生产状态文件中，**未上传 GitHub**。
-
-本仓库是**部署归档和 UI 代码仓库**，不是完整后端源码仓库。后续取得原 Go 工程后，应补齐版本、依赖和构建流程，再与这里的部署版本核对。
-
-## 二、与财务站的关系
-
-配套仓库：[deviy-finance](https://github.com/WilliamBacteria/deviy-finance)。
+“给客户虚拟机安装的控制程序”对应第三行，不能用宿主机 Agent 替代。
 
 ~~~text
-客户 → www.deviy.cn 财务站
-            ↓ 认证的主控 API
-       Deviy Controller
-            ↓ 节点协议 / Agent
-       虚拟化节点与实际资源
-
-管理员 → demovps.deviy.cn → Nginx → Controller 内嵌页面
-                                     ↑
-                           /__azure/ 注入的 UI
+财务系统 / 管理员
+        ↓
+集中 Controller（demovps.deviy.cn）
+        ↓ Bearer Token / 按配置使用 mTLS
+宿主机 Agent
+        ├── KVM/libvirt、PVE API 或 Hyper-V
+        ├── VM 状态、IP 发现、监控、NAT 映射
+        └── 宿主机私网 → 虚拟机内部 Guest Agent
+                              └── 密码、网络、DNS、磁盘等系统操作
 ~~~
 
-Controller 聚合节点、虚拟机、镜像和 IP 池；具体操作以当前二进制及节点能力为准。本仓库没有增加或模拟任何主控接口。
+配套财务项目为 [deviy-finance](https://github.com/WilliamBacteria/deviy-finance)。财务、宿主机和 Guest 的接口凭据属于不同层级，不能互相混用。
 
-## 三、文件结构
+## 二、用户关心的功能在哪里
+
+### 修改虚拟机登录密码
+
+- Guest HTTP 入口：agent/cmd/deviy-guest-agent/main.go 中的 POST /password。
+- Windows 实现：guest_windows.go；Linux 实现：guest_linux.go。
+- Linux 调用 chpasswd 等系统工具；Windows 使用相应本机用户管理命令。
+- 宿主机转发：agent/internal/server/server.go 的 handleVMGuestPassword，经 /api/vms/{id}/guest/password 转向 VM 私网的 8099 端口。
+- Controller 负责将受认证操作转发到对应节点。
+
+Guest Agent 默认允许来源 192.168.122.1/32；另可配置 X-Deviy-Token。实际网桥地址不同就必须调整 --allow。当前代码允许 Token 为空，此时依赖来源 CIDR 限制；上线应配置专用随机 Token、核对网桥与防火墙，不能把 8099 暴露为公网通用管理接口。
+
+### 获取虚拟机 IP
+
+IP 发现主要位于宿主机 provider 层，例如 agent/internal/provider/kvm.go 中 dhcpIP、configuredIP。PVE、Hyper-V 各有自身适配。Guest 的 POST /network 是修改网络参数，**不是用于查询 IP 的 GET 接口**；不要将配置接口当成查询接口。
+
+### Guest Agent 其他入口
+
+| 路径 | 方法 | 作用 |
+| --- | --- | --- |
+| /health | 当前 handler 返回健康信息 | 确认程序可达 |
+| /password | POST | 修改指定用户密码 |
+| /network | POST | 设置 IPv4、掩码前缀、网关和 DNS |
+| /dns | POST | 设置 DNS |
+| /datadisk | POST | 数据盘配置 |
+| /resize | POST | 扩容 |
+| /reboot | POST | 重启 |
+| /hostname | POST | 设置主机名 |
+
+入口统一经过来源 CIDR 检查与已配置的 Token 检查。Windows 和 Linux 实现有差异，具体以各平台源码为准。Windows 还包含从 SMBIOS 读取初始化信息的逻辑；不能把其中的网络初始化行为误认为一般只读监控。
+
+## 三、目录结构
 
 ~~~text
-bin/deviy-controller             原站点 Linux x86-64 程序
-ui-azure/                        独立 UI 样式、脚本、Logo、字体
-deploy/controller.env.example    无密码、无 Token 的环境变量模板
-deploy/controller-state.example.json  空状态模板
-deploy/deviy-controller.service  systemd 服务示例
-deploy/nginx.example.conf        HTTPS 反向代理与 UI 注入示例
-scripts/verify-artifact.py       校验程序 SHA-256
-CHECKSUMS.sha256                 归档程序的哈希
-README.md                       本说明
+controller/
+  go.mod                         deviy.cloud/controller
+  cmd/deviy-controller/          主控入口
+  cmd/mtls-check/                mTLS 检查辅助程序
+  internal/controller/          HTTP、认证、节点、IP 池和主机管理
+  internal/controller/web/      Go embed 的 HTML、Logo、noVNC 等资源
+agent/
+  go.mod                         deviy.cloud/agent
+  cmd/deviy-agent/               宿主机被控
+  cmd/deviy-guest-agent/         Windows/Linux 客户机内程序
+  cmd/deviy-cert/                证书生成器
+  internal/provider/            KVM、PVE、Hyper-V、mock
+  internal/server/              Agent HTTP API
+  internal/network/             nftables / Windows 网络适配
+  internal/metrics/             Linux / Windows 指标采集
+  internal/heartbeat/           节点注册与心跳
+  internal/tlsutil/             TLS、mTLS、证书辅助
+ui-azure/                        现网通过 Nginx 注入的独立 UI 层
+deploy/
+  kvm/                          KVM/PVE 安装脚本及说明
+  hyperv/                       Hyper-V / WinNAT 安装脚本及说明
+  windows/                      Guest Agent、VirtIO 安装/校验脚本
+  deviy-controller.service       主控 systemd 示例
+  controller.env.example        无密钥环境变量模板
+  controller-state.example.json 空状态模板
+  nginx.example.conf            HTTPS 与 UI 注入示例
+bin/deviy-controller            原现网 Linux x86-64 程序归档
+CHECKSUMS.sha256                 原归档程序哈希
+scripts/verify-artifact.py       校验原归档程序
 ~~~
 
-原站点路径为 /www/wwwroot/demovps.deviy.cn；示例沿用该路径，使用其他安装目录时同时修改 systemd、Nginx 和文件权限。
+两个 Module 当前只引用 Go 标准库，没有外部 require，因此没有人为补造 go.sum。noVNC 的第三方静态资源与许可随源目录保留。
 
-## 四、环境要求与程序校验
+## 四、构建环境与步骤
 
-- Linux x86-64。
-- systemd 或其他可靠进程管理器。
-- Nginx；对外使用有效 HTTPS 证书。
-- 到虚拟化节点或 Agent 的网络连通性。
-- 具有读写状态文件权限的独立运行账户。
-- Python 3 仅用于仓库提供的哈希校验脚本，不是主控运行依赖。
+两个 go.mod 均声明 **Go 1.27**；本次核对使用 **Go 1.27.3 / Windows amd64**。使用匹配工具链，不要为绕过版本检查随意降低 go.mod。
 
-克隆并校验：
+### 在 Linux/macOS shell 构建
+
+在仓库根目录执行：
 
 ~~~bash
-git clone https://github.com/WilliamBacteria/deviy-vps-controller.git
-cd deviy-vps-controller
+mkdir -p dist
+cd controller
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../dist/deviy-controller-linux-amd64 ./cmd/deviy-controller
+cd ../agent
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../dist/deviy-agent-linux-amd64 ./cmd/deviy-agent
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ../dist/deviy-agent-windows-amd64.exe ./cmd/deviy-agent
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ../dist/deviy-guest-agent-windows-amd64.exe ./cmd/deviy-guest-agent
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../dist/deviy-guest-agent-linux-amd64 ./cmd/deviy-guest-agent
+cd ..
+~~~
+
+### 在 Windows PowerShell 构建
+
+~~~powershell
+New-Item -ItemType Directory -Force dist | Out-Null
+$env:CGO_ENABLED = '0'
+$env:GOARCH = 'amd64'
+$env:GOOS = 'linux'
+Set-Location controller
+go build -o ../dist/deviy-controller-linux-amd64 ./cmd/deviy-controller
+Set-Location ../agent
+go build -o ../dist/deviy-agent-linux-amd64 ./cmd/deviy-agent
+go build -o ../dist/deviy-guest-agent-linux-amd64 ./cmd/deviy-guest-agent
+$env:GOOS = 'windows'
+go build -o ../dist/deviy-agent-windows-amd64.exe ./cmd/deviy-agent
+go build -o ../dist/deviy-guest-agent-windows-amd64.exe ./cmd/deviy-guest-agent
+Set-Location ..
+Remove-Item Env:GOOS
+~~~
+
+要使用部署安装器，将构建输出复制到安装器旁并按其要求命名：
+
+- KVM：deviy-agent-linux-amd64。
+- Hyper-V：deviy-agent.exe。
+- Windows 客户机：deviy-guest-agent.exe。
+
+仓库未包含 Windows VirtIO 第三方安装 EXE、镜像和 ISO。需要驱动时从可信官方来源单独准备。
+
+## 五、测试与验证范围
+
+在每个 Module 目录独立运行：
+
+~~~bash
+cd controller
+go test ./...
+cd ../agent
+go test ./...
+~~~
+
+2026-11-24 核对记录：
+
+- Controller 在 Windows amd64 上通过 go test ./...。
+- Agent 在 Windows amd64 上通过 go test ./...，含宿主机 provider、网络、指标、HTTP、心跳及 TLS 测试。
+- Linux amd64 交叉构建与 Agent Windows amd64 构建按本次记录核对。
+- Guest Agent 入口没有独立单元测试，本次只验证平台构建。
+- 本次未在真实宿主机执行改密码、改网、重启、磁盘格式化或虚拟机删除。
+
+测试中的 mock 和 HTTP 假服务不能替代实际节点验收。新版本应先在隔离节点与测试 VM 验证。
+
+## 六、版本与现网程序的对应关系
+
+原归档 bin/deviy-controller 的 Go BuildInfo 显示：
+
+- Module：deviy.cloud/controller。
+- 入口：deviy.cloud/controller/cmd/deviy-controller。
+- Go：1.27.3。
+- 目标：linux/amd64，CGO_ENABLED=0。
+
+与找回源码的模块、入口和工具链对应。本次没有把重新编译的文件替换到生产，也没有声称源码与现网二进制逐字节等同；具体行为仍需版本核对与验收。
+
+保留 CHECKSUMS.sha256 只用于校验原归档程序。dist 新构建产物应另行记录哈希，不能用原哈希要求新文件必然一致。Go 内嵌页面和现网 ui-azure 独立展示层是两层，后续发布需要同步考虑。
+
+## 七、集中主控部署
+
+新安装示例：
+
+~~~bash
 python3 scripts/verify-artifact.py
-chmod 755 bin/deviy-controller
-./bin/deviy-controller --help
-~~~
-
-SHA-256 用于检测归档内容变化，不等于供应链签名或恶意代码审计。程序来自用户授权管理的现网部署，本仓库没有修改程序字节。
-
-## 五、全新环境部署
-
-1. 安装可执行程序和 UI：
-
-~~~bash
 install -d -m 755 /www/wwwroot/demovps.deviy.cn
-install -m 755 bin/deviy-controller /www/wwwroot/demovps.deviy.cn/deviy-controller
+install -m 755 dist/deviy-controller-linux-amd64 /www/wwwroot/demovps.deviy.cn/deviy-controller
 cp -R ui-azure /www/wwwroot/demovps.deviy.cn/
 ~~~
 
-2. 新环境创建空状态。**恢复现网时不要执行这一步覆盖原状态**：
+全新环境可以复制 deploy/controller-state.example.json 初始化状态。**现网恢复不可用空模板覆盖原状态。**
 
-~~~bash
-cp deploy/controller-state.example.json /www/wwwroot/demovps.deviy.cn/controller-state.json
-chown www:www /www/wwwroot/demovps.deviy.cn/controller-state.json
-chmod 600 /www/wwwroot/demovps.deviy.cn/controller-state.json
-~~~
-
-3. 创建独立机密配置：
+机密配置：
 
 ~~~bash
 install -d -m 700 /etc/deviy-controller
 install -m 600 deploy/controller.env.example /etc/deviy-controller/controller.env
 ~~~
 
-编辑该文件，设置 DEVIY_ADMIN_USER、DEVIY_ADMIN_PASSWORD 和 DEVIY_API_TOKEN；保留真实值在服务器中，不提交仓库。新的随机 Token 还须在财务站配置为相同值。
-
-4. 修改 deploy/deviy-controller.service 中的 www 用户、组和路径，使其与服务器匹配，安装后启动：
+在服务器上填写 DEVIY_ADMIN_USER、DEVIY_ADMIN_PASSWORD 和 DEVIY_API_TOKEN，真实值不进入 Git。按目录和运行账户调整 deploy/deviy-controller.service，安装后运行：
 
 ~~~bash
-cp deploy/deviy-controller.service /etc/systemd/system/deviy-controller.service
 systemctl daemon-reload
 systemctl enable --now deviy-controller
 systemctl status deviy-controller
 ~~~
 
-程序默认仅监听回环地址，外部访问通过 HTTPS Nginx。直接启动用于故障排查时，需要自行以相同权限加载环境配置，不要在 shell 历史记录里输入完整密码或 Token。
+参数和环境变量见 controller/cmd/deviy-controller/main.go，包括监听地址、节点注册、mTLS 与状态路径。默认使用回环监听，通过 HTTPS Nginx 对外服务。
 
-## 六、程序命令行参数
+Nginx 示例在 deploy/nginx.example.conf。/__azure/ 提供独立静态文件，sub_filter 注入主题与 UI，保留 WebSocket 升级。先 nginx -t，再 reload；宝塔中合并到现有站点，不覆盖证书和面板 PHP 配置。
 
-以归档程序 --help 输出为依据：
+## 八、宿主机与客户机部署
 
-| 参数 | 说明 |
-| --- | --- |
-| --listen | HTTP/API 监听地址；示例使用 127.0.0.1:18088 |
-| --state | 状态 JSON 文件路径 |
-| --nodes | JSON 节点数组；恢复环境优先保留原状态配置 |
-| --admin-user、--admin-password | Web 管理认证；现网使用 DEVIY_ADMIN_USER / DEVIY_ADMIN_PASSWORD 环境变量 |
-| --api-token | 机器接口 Bearer Token；现网使用 DEVIY_API_TOKEN 环境变量 |
-| --allow-register | 允许节点注册；默认不启用 |
-| --register-token | 节点注册 Token |
-| --agent-ca、--agent-cert、--agent-key | 主控到 Agent 的 mTLS 证书配置 |
-| --listen-cert、--listen-key | 主控自身 HTTPS 证书 |
-| --client-ca | 要求接入主控 HTTPS 的客户端证书 |
+### KVM / PVE
 
-不要复制现网节点 Token 或私钥进 README、脚本或命令行示例。Agent 注册应按实际部署管理，不能把公开注册作为默认配置。
+阅读 deploy/kvm/README.md 和 install-deviy-kvm.sh --help。KVM 模式依赖 libvirt、virsh、virt-install 等；PVE 模式直接对接 PVE API。安装器可能安装软件包、配置 NAT 和防火墙，先核对实际网桥与管理来源。
 
-## 七、Nginx 与 UI 注入
+### Hyper-V
 
-原程序内嵌页面，ui-azure 通过 Nginx sub_filter 注入：
+阅读 deploy/hyperv/README.md。Agent 运行于 Hyper-V 宿主机，以 PowerShell 对接 Hyper-V、WinNAT 和 Windows Firewall。按实际 Internal Switch、CIDR、网关和允许的主控来源配置。
 
-- /__azure/ 使用 alias 指向 ui-azure。
-- theme-init.js 在 head 注入，尽早读取主题。
-- azure.css、theme.css、azure.js、theme.js 在 body 结束前加载。
-- 关闭发往上游的 Accept-Encoding，保证 HTML 可以被 sub_filter 修改。
-- WebSocket Upgrade 保留，用于长连接场景。
-- 生产入口使用 HTTPS；示例证书路径必须替换。
+### Windows Guest Agent
 
-参考 deploy/nginx.example.conf。检查 nginx -t 成功后再 reload。宝塔环境在对应站点的配置里合并，不要同时复制出重复 server 块或覆盖面板证书配置。
+把构建后的 deviy-guest-agent.exe 与 deploy/windows/Install-DeviyGuestAgent.ps1 放在一起，管理员 PowerShell 执行安装脚本。安装器使用计划任务启动程序，并限制 Guest 管理端口的来源。
 
-只改 UI 时无需重编译 Go 程序；更新静态文件并同步调整注入 URL 的版本参数即可。
+默认 AllowedCIDR 是 192.168.122.1/32，Token 参数应使用独立随机值。安装后先用 /health 验证连通，再在测试 VM 验证操作。不要在生产 VM 通过随意修改网络或初始化数据盘来“测试安装”。
 
-## 八、财务侧接入
+### Linux Guest Agent
 
-财务项目使用 config/deviy.php 中的：
+构建目标为 linux/amd64，核心操作需要 root 权限。依照实际发行版准备系统工具，配置仅允许宿主机访问的管理网络和来源限制。仓库未提供经验证的通用 Linux Guest systemd 安装器，不把编译成功描述为安装已完成。
 
-- DEVIY_CONTROLLER_URL：后端访问地址，同机部署可用 http://127.0.0.1:18088。
-- DEVIY_CONTROLLER_PUBLIC_URL：外部可访问的 HTTPS 地址。
-- DEVIY_CONTROLLER_TOKEN：与主控 API Token 一致。
-- DEVIY_CONTROLLER_CA / CERT / KEY：按实际 mTLS 使用。
-- DEVIY_CONTROLLER_STATE_PATH：确需共享状态时按现有设计配置，不能任意指向其他站点数据。
+## 九、备份、恢复与上线边界
 
-接口调用规则以财务仓库 app/Services/Provisioning 的实现及主控页面为准。本次没有从二进制推导一份未经验证的 API 文档。
+Git 不包含：
 
-## 九、状态、备份与恢复
+- .certs、私钥、生产 .env、节点 Token 或 Guest Token。
+- controller-state.json、节点地址清单、IP 分配与客户 VM 绑定。
+- .tools、.work、_radar_update、缓存、历史临时部署程序。
+- 原工程中的 PHP 财务 app、数据库、日志、会话。
+- ISO、QCOW2、VHDX、备份磁盘和 Windows 第三方安装包。
 
-生产 controller-state.json 至少包含：
+恢复时需要另行取得生产状态、节点凭据、证书、镜像和实际磁盘。主控、宿主机和 Guest 的版本均需确认；不能只恢复 Git 就宣称恢复了客户 VM。
 
-- nodes：节点 ID、地址、令牌、目录、桥接和端口配置。
-- images：镜像、模板路径和节点对应关系。
-- ip_pools：地址段、网关、类型与分配记录。
-- vm_allocations：虚拟机到地址分配的绑定。
+升级前备份状态并记录版本，使用独立环境核对接口和权限。避免两份主控同时写同一状态，避免财务与主控重复执行开通或扣费。新源码本次仅上传仓库，没有重启或替换现网程序。
 
-这些数据不在 GitHub。备份时需考虑程序仍在写入，采用一致性快照或在维护窗口停止写入后备份。备份文件加密保存，并限制访问。
+## 十、公开仓库的内容边界与许可
 
-恢复必须同时核对：
+本次按所有者授权保持公开，并对新增文件执行敏感信息扫描。示例地址、测试证书生成代码和单元测试中的假 Token 不代表生产凭据。新增部署文件时仍应检查待提交内容，不能把客户端或机房的配置直接复制进来。
 
-1. 程序哈希和 UI 版本。
-2. 原状态文件、管理员与 API 配置。
-3. 节点 Agent、Token、证书及网络连通性。
-4. IP 池、虚拟机 ID 和财务资源关联。
-5. 镜像、磁盘、桥接和端口配置。
-6. Nginx 与域名证书。
+仓库公开不自动授予额外的软件许可。本次没有为用户项目擅自添加开源许可证；第三方 noVNC、pako、字体等遵循各自目录中的原许可。
 
-**不要用空模板覆盖现有状态，也不要启动两份主控共同写同一个状态文件。** 没有 Agent 和实际节点，恢复此仓库不能恢复客户的磁盘或虚拟机。
+## 十一、维护建议
 
-## 十、更新、排障与回滚
-
-- 修改 UI 前记录 Git 提交号。
-- 替换可执行文件前备份程序、状态、机密配置，核对兼容性。
-- 回滚程序不一定回滚状态格式，先确认新旧版本的数据兼容。
-- 认证失败：核对环境文件、systemd 配置和财务 Token，避免把真实值输出日志。
-- UI 没加载：检查 /__azure/ 路径、Nginx sub_filter、压缩、缓存与资源版本。
-- 节点离线：核对节点服务、地址、证书和网络，不以修改前端状态代替实际恢复。
-- 无法写状态：核对运行账户、文件所有者与父目录权限。
-- 502：检查 systemctl status deviy-controller 与监听端口。
-- 日志：journalctl -u deviy-controller，另查 Nginx error log；对外分享前去除敏感内容。
-
-## 十一、许可与维护
-
-该私有归档不声明对二进制或第三方资源的开源授权。Noto 字体许可保留于对应资源目录。
-
-后续获取 Go 源码后，应增加 go.mod / go.sum、版本标记、构建校验、测试与发布说明；在此之前，不要把本仓库描述为可完整重编译的主控源码。
-
-
-## 2026-11-24 品牌更新
-
-采用站点所有者选定的蓝色云形 / V 形标识与“德威云计算 DEVIY CLOUD”字标。包含透明底浅色和深色 PNG、favicon，并为资源 URL 增加版本参数。图像提取自确认的设计稿，本次未生成或声明可编辑矢量源文件。
+源代码、编译产物和生产数据分别管理。按功能分支审查修改，记录构建工具链、测试结果与产物 SHA-256。Guest 密码和网络相关变更应与宿主机转发实现一起验证。现网修复应回传源码，避免只有一个新二进制而无法追踪实现。
