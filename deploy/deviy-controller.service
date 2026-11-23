@@ -1,0 +1,17 @@
+[Unit]
+Description=Deviy Cloud Controller
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/www/wwwroot/demovps.deviy.cn
+EnvironmentFile=/etc/deviy-controller/controller.env
+ExecStart=/www/wwwroot/demovps.deviy.cn/deviy-controller --listen=127.0.0.1:18088 --state=/www/wwwroot/demovps.deviy.cn/controller-state.json --nodes=[]
+Restart=always
+RestartSec=3
+User=www
+Group=www
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
