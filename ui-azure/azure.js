@@ -5,7 +5,10 @@ const svg=name=>'<svg class="az-icon" width="20" height="20" viewBox="0 0 24 24"
 const make=(tag,cls,html)=>{const e=document.createElement(tag);e.className=cls;if(html)e.innerHTML=html;return e};
 // The upstream binary emits a redundant direct body text node before its shell.
 for(const node of [...document.body.childNodes])if(node.nodeType===Node.TEXT_NODE&&/^(登录\s*·\s*)?Deviy Controller$/.test(node.textContent.trim()))node.textContent='';
-const logo='/__azure/logo.png';
+const logo='/__azure/logo.png?v=20261124-brand1';
+let brandIcon=document.querySelector('link[rel~="icon"]');
+if(!brandIcon){brandIcon=document.createElement('link');brandIcon.rel='icon';document.head.append(brandIcon)}
+brandIcon.href='/__azure/favicon.ico?v=20261124-brand1';
 if(document.getElementById('login-form')){
  document.body.classList.add('az-login');document.title='管理员登录 · Deviy Controller';document.querySelectorAll('.brand-logo').forEach(e=>e.src=logo);
  const form=document.getElementById('login-form');const img=make('img','az-login-brand');img.src=logo;img.alt='Deviy Cloud 德威云计算';img.style.width='165px';img.style.height='auto';img.style.marginBottom='27px';form.prepend(img);return;
